@@ -111,8 +111,10 @@ UpdateCountyNames <- function(tbl) {
   return(results)
 }
 
-## Process Census data
-## Process Census Gazetteer counties & county subdivisions
+####################################################################################################
+
+## Load data
+## Load Census Gazetteer counties
 
 gazetteer_temp <- tempfile()
 download.file(
@@ -153,6 +155,7 @@ counties_raw <- read_tsv(
 
 rm(list = c("gazetteer_zip", "gazetteer_temp"))
 
+## Load Census Gazetteer county subdivisions
 gazetteer_temp <- tempfile()
 download.file(
   "http://www2.census.gov/geo/docs/maps-data/data/gazetteer/2017_Gazetteer/2017_Gaz_cousubs_national.zip",
@@ -194,33 +197,7 @@ subdivisions_raw <- read_tsv(
 
 rm(list = c("gazetteer_zip", "gazetteer_temp"))
 
-counties_clean <- counties_raw %>%
-  select(c("geoid", "state_abbr", "name")) %>%
-  UpdateCountyNames() %>%
-  SplitGEOID() %>%
-  UpdateFIPS() %>%
-  CreateKey()
-
-subdivisions_clean <- subdivisions_raw %>%
-  select(c("geoid", "state_abbr", "name")) %>%
-  SplitGEOID() %>%
-  RemoveUndefinedSubdivisions() %>%
-  UpdateFIPS() %>%
-  CreateKey()
-
-counties_merge <- counties_clean %>%
-  select(c("geoid", "state_abbr", "name", "key")) %>%
-  distinct()
-
-subdivisions_merge <- subdivisions_clean %>%
-  select(c("geoid", "state_abbr", "name", "key")) %>%
-  distinct()
-
-## Create a union of county and county subdivisions
-places_merge = dplyr::union(x = counties_merge,
-                            y = subdivisions_merge)
-
-## Process OpenElex data
+## Load OpenElex data
 openelex_raw <-
   read_csv(
     getURL(
@@ -248,6 +225,36 @@ openelex_raw <-
     )
   )
 
+## Process data
+
+counties_clean <- counties_raw %>%
+  select(c("geoid", "state_abbr", "name")) %>%
+  UpdateCountyNames() %>%
+  SplitGEOID() %>%
+  UpdateFIPS() %>%
+  CreateKey()
+
+subdivisions_clean <- subdivisions_raw %>%
+  select(c("geoid", "state_abbr", "name")) %>%
+  SplitGEOID() %>%
+  RemoveUndefinedSubdivisions() %>%
+  UpdateFIPS() %>%
+  CreateKey()
+
+counties <- counties_clean %>%
+  select(c("geoid", "state_abbr", "name", "key", "geography_type")) %>%
+  distinct()
+
+subdivisions <- subdivisions_clean %>%
+  select(c("geoid", "state_abbr", "name", "key", "geography_type")) %>%
+  distinct()
+
+## Create a union of county and county subdivisions
+places = dplyr::union(
+  x = counties,
+  y = subdivisions
+  )
+
 openelex_clean <- openelex_raw %>%
   mutate(name = str_trim(name)) %>%
   mutate(name = replace(name, which(is.na(name) &
@@ -256,94 +263,147 @@ openelex_clean <- openelex_raw %>%
   filter(!grepl("total", tolower(name))) %>%
   CreateKey()
 
-openelex_merge <- openelex_clean %>%
+openelex <- openelex_clean %>%
   select(c("state_abbr", "name", "key")) %>%
   distinct()
 
-rm(list = ls()[!ls() %in% c("openelex_merge",
-                            "counties_merge",
-                            "subdivisions_merge",
-                            "places_merge",
-                            "CreateKey")])
+rm(list = ls()[!ls() %in% c("openelex","places","CreateKey","openelex_clean")])
 
-
-##################################################
+####################################################################################################
 
 ne_states <- c("RI", "VT", "NH", "MA", "ME", "CT")
 
-## Join Census and OpenElex counties on unique key
-openelex_counties_merge <- full_join(
-  x = counties_merge,
-  y = openelex_merge,
+## Merge openelex places with Census counties
+## First filter places to show those place WE KNOW are county geographies types
+## This means no New England states
+places_counties <- places %>% 
+  filter(geography_type == 'county') %>%
+  filter(!state_abbr %in% ne_states)
+
+openelex_counties <- openelex %>%
+  filter(!state_abbr %in% ne_states)
+  
+## Full join Census and OpenElex counties on unique key
+openelex_counties_join <- full_join(
+  x = openelex_counties,
+  y = places_counties,
   by = "key",
-  suffix = c(".census", ".openelex")
+  suffix = c(".openelex", ".census")
 )
 
-openelex_counties_matched <- openelex_counties_merge %>%
-  filter(grepl("", name.census) & grepl("", name.openelex))
+openelex_counties_matched <- inner_join(
+  x = openelex_counties,
+  y = places_counties,
+  by = "key",
+  suffix = c(".openelex", ".census")
+)
 
-openelex_counties_unmatched <- openelex_counties_merge %>%
-  filter(!grepl("", name.census) | !grepl("", name.openelex))
+openelex_counties_unmatched <- anti_join(
+  x = openelex_counties,
+  y = places_counties,
+  by = "key"
+) 
 
-openelex_unmatched <- openelex_counties_unmatched %>%
-  filter(!grepl("", name.census)) %>%
-  select(c("state_abbr.openelex", "name.openelex")) %>%
-  rename("state_abbr" = state_abbr.openelex,
-         "name" = name.openelex)
+places_counties_unmatched <- anti_join(
+  x = places_counties,
+  y = openelex_counties,
+  by = "key"
+) 
 
-counties_unmatched <- openelex_counties_unmatched %>%
-  filter(!grepl("", name.openelex)) %>%
-  select(c("state_abbr.census", "name.census")) %>%
-  rename("state_abbr" = state_abbr.census,
-         "name" = name.census)
+setdiff(openelex_counties_unmatched$key, openelex_counties_matched$key)
 
-unmatched_states_all <- unique(unlist(openelex_unmatched %>%
-                                        .$state_abbr))
+## Now do it again with county subdivisions
+places_subdivisions <- places %>% 
+  filter(geography_type == 'subdivision') %>%
+  filter(state_abbr %in% ne_states)
 
+openelex_subdivisions <- openelex %>%
+  filter(state_abbr %in% ne_states)
 
-unmatched_states_all_ne <- unique(unlist(
-  openelex_unmatched %>%
-    filter(state_abbr %in% ne_states) %>%
-    .$state_abbr
-))
+## Full join Census and OpenElex county subdivisions on unique key
+openelex_subdivisions_join <- full_join(
+  x = openelex_subdivisions,
+  y = places_subdivisions,
+  by = "key",
+  suffix = c(".openelex", ".census")
+)
 
-unmatched_states_not_ne <- unique(unlist(
-  openelex_unmatched %>%
-    filter(!state_abbr %in% ne_states) %>%
-    .$state_abbr
-))
+openelex_subdivisions_matched <- inner_join(
+  x = openelex_subdivisions,
+  y = places_subdivisions,
+  by = "key",
+  suffix = c(".openelex", ".census")
+)
 
+openelex_subdivisions_unmatched <- anti_join(
+  x = openelex_subdivisions,
+  y = places_subdivisions,
+  by = "key"
+) 
 
-alignment_matches <- data.frame(
+places_subdivisions_unmatched <- anti_join(
+  x = places_subdivisions,
+  y = openelex_subdivisions,
+  by = "key"
+) %>%
+  filter(state_abbr %in% ne_states)
+
+## Create a union of matched counties and county subdivisions
+openelex_matched <- dplyr::union(x = openelex_counties_matched,
+                                  y = openelex_subdivisions_matched) %>%
+  select(c("key","geoid"))
+
+## Create a union of unmatched counties and county subdivisions
+openelex_unmatched <- dplyr::union(x = openelex_counties_unmatched,
+                                 y = openelex_subdivisions_unmatched) %>%
+  select(c("state_abbr","name")) # drop key since we were unable to match on this variable
+
+## Create a union of unmatched counties and county subdivisions to match against
+places_to_match <- dplyr::union(x = places_counties_unmatched,
+                                   y = places_subdivisions_unmatched)
+
+rm(list = ls()[!ls() %in% c("openelex","places","openelex_matched","openelex_unmatched","places_to_match","ne_states","CreateKey","openelex_clean")])
+
+####################################################################################################
+# Local Alignment process
+
+unmatched_states <- unique(unlist(openelex_unmatched %>% .$state_abbr))
+
+alignment_result <- data.frame(
   missing_name = character(),
   state_abbr = character(),
   matched_name = character(),
   stringsAsFactors = FALSE
 )
 
-for (state in unmatched_states_not_ne) {
+for (state in unmatched_states) {
   print(state)
   
   ## Find closest matches of missing counties using local alignment
   alignment_unmatched <- openelex_unmatched %>%
-    filter(grepl(state, state_abbr)) %>%
+    filter(state_abbr == state) %>%
     rename("missing_name" = name)
   
-  unmatched_names <- counties_unmatched %>%
-    filter(grepl(state, state_abbr)) %>%
-    .$name
-  
-  if (nrow(counties_unmatched %>%
-           filter(grepl(state, state_abbr))) == 0) {
+  alignment_to_match <- places_to_match %>% filter(state_abbr == state)
+    
+  if (nrow(alignment_to_match) == 0) {
     next
   } else {
-    alignment_matched <- alignment_unmatched %>%
+    if (!state %in% ne_states) {
+      alignment_to_match <- alignment_to_match %>% .$name
+    } else {
+      alignment_to_match <- alignment_to_match %>% filter(geography_type == 'subdivision') %>% .$name
+    }
+    
+    print(alignment_to_match)
+    
+    alignment_matches <- alignment_unmatched %>%
       mutate(
         matched_name = missing_name %>%
           sapply(
             function(n)
               pairwiseAlignment(
-                tolower(unmatched_names),
+                tolower(alignment_to_match),
                 tolower(n),
                 type = "local",
                 gapOpening = 0,
@@ -352,30 +412,55 @@ for (state in unmatched_states_not_ne) {
               ) %>%
               which.max
           ) %>%
-          unmatched_names[.]
+          alignment_to_match[.]
       )
-    alignment_matches <- bind_rows(alignment_matches,
-                                   alignment_matched)
     
+    alignment_result <- dplyr::union(x = alignment_result,
+                                     y = alignment_matches)
+
   }
   
   rm(list = c(
     "alignment_unmatched",
-    "unmatched_names",
-    "alignment_matched"
+    "alignment_to_match",
+    "alignment_matches"
   ))
   
 }
 
-alignment_results <- alignment_matches %>%
-  rename(name = "matched_name") %>%
-  CreateKey() %>%
-  select(c("state_abbr","missing_name","key")) %>%
-  rename(name = "missing_name")
 
-alignment_results_merge <- left_join(x = openelex_counties_unmatched,
-                             y = alignment_results,
-                             by = "key",
-                             suffix = c("", ".results")
-                             )
+rm(list = ls()[!ls() %in% c("alignment_result","places_to_match","openelex_matched","CreateKey","openelex_clean")])
+
+####################################################################################################
+## Final Results
+
+alignment_matched <- alignment_result %>%
+  select(c("matched_name","state_abbr","missing_name")) %>%
+  rename(name = "matched_name") %>%
+  CreateKey()
+
+alignment_join <- inner_join(x = places_to_match,
+                             y = alignment_matched,
+                             by ="key",
+                             suffix = c(".census",".alignment")) %>%
+  select(c("geoid","missing_name","state_abbr.alignment")) %>%
+  rename(name = "missing_name",
+         state_abbr = "state_abbr.alignment") %>%
+  CreateKey() %>%
+  select("geoid","key")
+
+matched_results <- dplyr::union(x = openelex_matched,
+                                y = alignment_join
+                                )
                              
+## Merge results back to original OpenElex file
+openelex_results <- full_join(x = openelex_clean,
+                              y = matched_results,
+                              by = "key"
+                              ) %>%
+  select(-c(key))
+
+openelex_distinct <- openelex_clean %>% select("state_abbr", "name") %>% distinct()
+
+write_csv(openelex_results, paste(getwd(),"data/results.csv",sep="/"))
+
